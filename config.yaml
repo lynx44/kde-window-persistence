@@ -1,0 +1,47 @@
+# window-persistence configuration
+#
+# Profiles are matched top-to-bottom; the FIRST profile whose `when_connected`
+# outputs are ALL currently connected becomes active. Put the most specific
+# (most monitors) profile first and a bare fallback (when_connected: []) last.
+#
+# Output names match `kscreen-doctor -o` / /sys/class/drm (e.g. eDP-1, DP-2).
+#
+# Each rule:
+#   match:    case-insensitive substring tested against each open browser TAB title
+#   browser:  optional, "brave-browser" or "firefox" (limits which browser to act on)
+#   desktop:  virtual-desktop number, 1-based (you currently have 5)
+#   screen:   output name the window should land on
+#   zone:     tile index on that screen (0-based, left-to-right as in the Meta+T editor)
+#             OR the literal "maximize"
+
+settle_ms: 350          # pause after raising a tab before moving its window
+
+profiles:
+  - name: docked
+    when_connected: [DP-2]          # external ultrawide present
+    rules:
+      - match: "Calendar"
+        browser: brave-browser
+        desktop: 3
+        screen: DP-2
+        zone: 0                      # left tile of the ultrawide
+      - match: "Google Sheets"
+        desktop: 2
+        screen: DP-2
+        zone: 1                      # right tile of the ultrawide
+      - match: "Standard Edge Mail"
+        desktop: 1
+        screen: eDP-1
+        zone: maximize
+
+  - name: laptop
+    when_connected: []              # fallback: laptop screen only
+    rules:
+      - match: "Calendar"
+        desktop: 1
+        screen: eDP-1
+        zone: maximize
+      - match: "Standard Edge Mail"
+        desktop: 2
+        screen: eDP-1
+        zone: maximize

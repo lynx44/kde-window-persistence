@@ -1,0 +1,13 @@
+[Unit]
+Description=window-persistence: auto place browser windows on dock/undock
+# Wait for the Plasma session bus to be up.
+After=plasma-kwin_wayland.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u %h/git/window-persistence/wp.py watch --mode snapshot --interval 2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
