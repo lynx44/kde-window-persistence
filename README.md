@@ -40,6 +40,49 @@ Trayscale) can resist programmatic geometry and may not move. Tile *membership*
 is reattempted but, because reassigning it is unreliable on Plasma 6.6, the saved
 **geometry** is what guarantees the position.
 
+## Fit (rescue off-screen / oversized windows)
+
+When you undock, KWin moves windows off the removed monitor but keeps their
+*size* — so a window sized for a big external can hang off the smaller laptop
+screen. New windows also open "pseudo-maximized" to the full screen height and
+spill behind the panel. `fit` clamps any floating window to its screen's
+**maximize area** (which excludes panels — e.g. 1600×954 on a 1600×1000 laptop):
+
+```bash
+wp fit            # resize/move anything off-screen or oversized back into view
+wp fit --dry-run  # show what it would change, touch nothing
+```
+
+It leaves tiled, fullscreen, and minimized windows alone. The `watch` daemon
+runs `fit` automatically right after each dock change, so this is mostly
+hands-off; the manual command is for when you open something new and it spills.
+
+Windows that are *flagged* maximized but still sized for the monitor you left are
+re-maximized (see below) rather than clamped, so they stay genuinely maximized
+instead of becoming a plain window that merely looks like one. A maximized window
+that **under**-fills the area is left alone — that's an app honouring size hints
+(KRDC, terminals with cell increments), and forcing it would never converge.
+
+## Maximizing the way the OS does
+
+Placing a window "maximized" — via a `maximize` zone, `restore`, or `fit` — goes
+through one helper that reproduces exactly what the titlebar button does. Two
+rules, both of which used to be broken and are the reason maximized windows came
+back oversized from a dock change:
+
+1. **Maximize to the panel-aware area, not the output rect.** `output.geometry` is
+   the whole screen *including* the panel (1600×1000 on this laptop);
+   `workspace.clientArea(MaximizeArea, output, desktop)` excludes it (1600×954).
+   Using the former left every maximized window 46px too tall, with its bottom
+   edge hidden behind the taskbar.
+2. **Never write `frameGeometry` while the window is still maximized.** KWin treats
+   that write as the *new* maximized rectangle, so the window keeps the oversized
+   geometry **and** stays flagged maximized — which in turn makes
+   `setMaximize(true, true)` a no-op. That is precisely why such a window would
+   only snap to the right size when you clicked maximize by hand. Unmaximizing
+   first (the flag flips synchronously, even though the client-side resize is
+   async) makes the write safe and the whole operation idempotent.
+
 ## How it works
 
 | Step | Mechanism |

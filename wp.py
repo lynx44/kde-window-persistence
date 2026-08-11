@@ -116,8 +116,31 @@ def raise_tab(tab_id, service):
 
 # ---------- KWin placement ----------
 
+# Maximize the way the titlebar button does. Two rules, both learned the hard way
+# on Plasma 6.6 (eDP-1 is 1600x1000, its MaximizeArea 1600x954 — a 46px panel):
+#
+#  1. Maximize to clientArea(MaximizeArea), NOT to out.geometry. The output rect
+#     includes the panel, so `frameGeometry = out.geometry` leaves the window 46px
+#     too tall with its bottom edge behind the taskbar.
+#  2. NEVER write frameGeometry while the window is still maximized. KWin takes the
+#     write as the new maximized rect, so the window keeps the oversized geometry
+#     AND stays flagged maximized — which makes setMaximize(true,true) a no-op and
+#     is why such a window only snaps back when you click maximize by hand.
+#     Unmaximizing first (the flag flips synchronously, even though the client
+#     resize is async) makes the write safe and the whole helper idempotent.
+_MAX_HELPER = """
+  function maximizeOn(w, out, vd){
+    if (w.setMaximize) w.setMaximize(false, false);
+    var a = workspace.clientArea(2, out, vd);        // 2 = MaximizeArea (panel-aware)
+    w.frameGeometry = { x:Math.round(a.x), y:Math.round(a.y),
+                        width:Math.round(a.width), height:Math.round(a.height) };
+    if (w.setMaximize) w.setMaximize(true, true);
+  }
+"""
+
 KWIN_TMPL = """
 (function () {
+  %MAX%
   var w = workspace.activeWindow;
   if (!w) { throw new Error("WP: no active window to place"); }
   // virtual desktop
@@ -132,14 +155,13 @@ KWIN_TMPL = """
   if (!out) { throw new Error("WP: output not found: " + screenName); }
   %PLACEMENT%
 })();
-"""
+""".replace("%MAX%", _MAX_HELPER)
 
 def gen_kwin_script(desktop_index, screen, zone):
     if zone == "maximize":
         placement = (
             "w.tile = null;\n"
-            "  w.frameGeometry = out.geometry;\n"
-            "  if (w.setMaximize) { w.setMaximize(true, true); }"
+            "  maximizeOn(w, out, vd);"
         )
     else:
         idx = int(zone)
@@ -248,23 +270,25 @@ RESTORE_JS = """
       w.desktops = [];   // captured empty == shown on all desktops (sticky)
     }
     var out = e.output ? findOut(e.output) : null;
+    var vd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
     // Attempt tile membership (nice for tile-managed dragging), but always also
     // enforce the saved geometry: tile reassignment is unreliable for some
     // (esp. XWayland) windows, whereas the rectangle reproduces the layout.
     if (e.tile !== null && out){
-      var vd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
       var lv = leaves(out, vd);
       if (e.tile < lv.length){ w.tile = lv[e.tile]; }
     } else {
       w.tile = null;
     }
-    if (e.max === 3 && w.setMaximize) { w.setMaximize(true, true); }
+    // A maximized window is re-maximized (panel-aware) rather than restored to
+    // its saved rectangle — the saved one belongs to the output we just left.
+    if (e.max === 3) { maximizeOn(w, out || w.output, vd); }
     else { w.frameGeometry = { x:e.geom[0], y:e.geom[1], width:e.geom[2], height:e.geom[3] }; }
     done++;
   }
   throw new Error("WPRESTORE done=" + done + " miss=" + miss + " total=" + DATA.length);
 })();
-""".replace("%TILE%", _TILE_HELPERS)
+""".replace("%TILE%", _TILE_HELPERS + _MAX_HELPER)
 
 
 def state_key():
@@ -276,8 +300,9 @@ def state_path(key):
     return os.path.join(STATE_DIR, "layout-" + key.replace("/", "_") + ".json")
 
 
-def capture_layout(timeout=4.0):
-    """Run the capture KWin script; it pushes the layout JSON back via callDBus."""
+def run_collecting_script(js, timeout=4.0):
+    """Run a KWin script that pushes a JSON result back via callDBus to our sink,
+    and return the parsed JSON (or None on timeout)."""
     import dbus.service
     import dbus.mainloop.glib
     from gi.repository import GLib
@@ -297,13 +322,18 @@ def capture_layout(timeout=4.0):
     sink = Sink(bus, "/")
     try:
         GLib.timeout_add(int(timeout * 1000), loop.quit)
-        run_kwin_script(CAPTURE_JS)
+        run_kwin_script(js)
         loop.run()
     finally:
         sink.remove_from_connection()
         del busname
         bus.close()
     return json.loads(holder["data"]) if "data" in holder else None
+
+
+def capture_layout(timeout=4.0):
+    """Capture the current window layout (list of window dicts)."""
+    return run_collecting_script(CAPTURE_JS, timeout)
 
 
 def snapshot(key=None, verbose=True):
@@ -336,6 +366,69 @@ def restore(key=None, verbose=True):
     return True
 
 
+# ---------- fit (rescue off-screen / oversized windows) ----------
+#
+# After undocking, KWin moves windows off the removed output but keeps their
+# size, so windows sized for a big external can spill past the laptop screen.
+# New windows also open past the panel. `fit` clamps any floating window to its
+# screen's MAXIMIZE area (clientArea option 2 — panel-aware), so nothing hides
+# behind the panel or hangs off an edge. Tiled/fullscreen windows are left alone.
+
+FIT_JS = """
+(function(){
+  %MAX%
+  var APPLY = %APPLY%;
+  var changes = [];
+  var wins = workspace.windowList();
+  for (var i=0;i<wins.length;i++){
+    var w = wins[i];
+    if (!w.normalWindow || w.skipTaskbar || w.tile || w.fullScreen || w.minimized) continue;
+    var out = w.output || workspace.activeScreen;
+    var vd = (w.desktops && w.desktops.length) ? w.desktops[0] : workspace.currentDesktop;
+    var a = workspace.clientArea(2, out, vd);      // 2 = MaximizeArea (excludes panels)
+    var ax=Math.round(a.x), ay=Math.round(a.y), aw=Math.round(a.width), ah=Math.round(a.height);
+    var g = w.frameGeometry;
+    var gx=Math.round(g.x), gy=Math.round(g.y), gw=Math.round(g.width), gh=Math.round(g.height);
+    if (w.maximizeMode === 3){
+      // Already flagged maximized but still sized for the output we left: re-maximize
+      // here so KWin recomputes the rect, rather than clamping it into a plain window
+      // that merely looks maximized. Only when it OVERFLOWS the area — a maximized
+      // window that under-fills it is an app obeying size hints (krdc, terminals),
+      // and forcing that every run would never converge.
+      if (gx < ax-2 || gy < ay-2 || gx+gw > ax+aw+2 || gy+gh > ay+ah+2){
+        changes.push({ cls:w.resourceClass, from:[gx,gy,gw,gh], to:[ax,ay,aw,ah] });
+        if (APPLY) maximizeOn(w, out, vd);
+      }
+      continue;
+    }
+    var nw = Math.min(gw, aw), nh = Math.min(gh, ah);
+    var nx = Math.max(ax, Math.min(gx, ax + aw - nw));
+    var ny = Math.max(ay, Math.min(gy, ay + ah - nh));
+    if (Math.abs(nx-gx)>2 || Math.abs(ny-gy)>2 || Math.abs(nw-gw)>2 || Math.abs(nh-gh)>2){
+      changes.push({ cls:w.resourceClass, from:[gx,gy,gw,gh], to:[nx,ny,nw,nh] });
+      if (APPLY) w.frameGeometry = { x:nx, y:ny, width:nw, height:nh };
+    }
+  }
+  callDBus("%SINK%", "/", "%SINK%", "Report", JSON.stringify(changes));
+})();
+""".replace("%SINK%", SINK_BUS).replace("%MAX%", _MAX_HELPER)
+
+
+def fit(dry_run=False, verbose=True):
+    """Clamp off-screen / oversized floating windows back onto their screen."""
+    changes = run_collecting_script(FIT_JS.replace("%APPLY%", "false" if dry_run else "true"))
+    if changes is None:
+        if verbose:
+            print("fit: no response from KWin")
+        return False
+    if verbose:
+        verb = "would resize" if dry_run else "resized"
+        for c in changes:
+            print(f"  {c['cls']:24} {c['from']} -> {c['to']}")
+        print(f"fit: {verb} {len(changes)} window(s)" if changes else "fit: all windows already fit")
+    return True
+
+
 # ---------- preferred (golden) layout ----------
 #
 # Unlike a snapshot (keyed on per-window internalId, valid only within a
@@ -350,7 +443,7 @@ _TITLE_SUFFIXES = [" - Brave", " — Mozilla Firefox", " - Mozilla Firefox",
                    " - Google Chrome", " - Chromium"]
 
 # Shared JS: leaves() + findOut() + placeWin(w, e) used by both preferred scripts.
-_PLACE_FUNCS = _TILE_HELPERS + """
+_PLACE_FUNCS = _TILE_HELPERS + _MAX_HELPER + """
   function findOut(name){ var ss=workspace.screens; for(var i=0;i<ss.length;i++) if(ss[i].name===name) return ss[i]; return null; }
   function placeWin(w, e){
     var vds = workspace.desktops;
@@ -368,9 +461,9 @@ _PLACE_FUNCS = _TILE_HELPERS + """
         w.frameGeometry = { x:Math.round(g.x), y:Math.round(g.y), width:Math.round(g.width), height:Math.round(g.height) };
       }
     } else if (z.type === "maximize" && out){
-      w.tile = null; var og = out.geometry;
-      w.frameGeometry = { x:Math.round(og.x), y:Math.round(og.y), width:Math.round(og.width), height:Math.round(og.height) };
-      if (w.setMaximize) w.setMaximize(true, true);
+      w.tile = null;
+      var mvd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
+      maximizeOn(w, out, mvd);
     } else if (z.type === "free" && z.geom){
       w.tile = null;
       w.frameGeometry = { x:z.geom[0], y:z.geom[1], width:z.geom[2], height:z.geom[3] };
@@ -547,11 +640,11 @@ def apply_preferred(key=None, dry_run=False, settle_ms=350):
     return True
 
 
-def watch_snapshot(interval=2.0, settle=1.5, snap_every=4.0):
-    """Re-snapshot the current state periodically; restore on dock/undock."""
+def watch_snapshot(interval=2.0, settle=1.5, snap_every=4.0, do_fit=True):
+    """Re-snapshot the current state periodically; restore + fit on dock/undock."""
     last = None
     last_snap = 0.0
-    print(f"watch(snapshot): interval={interval}s snap_every={snap_every}s settle={settle}s")
+    print(f"watch(snapshot): interval={interval}s snap_every={snap_every}s settle={settle}s fit={do_fit}")
     while True:
         key = state_key()
         now = time.time()
@@ -564,6 +657,8 @@ def watch_snapshot(interval=2.0, settle=1.5, snap_every=4.0):
             print(f"[{time.strftime('%H:%M:%S')}] state change {last!r} -> {key!r}")
             time.sleep(settle)              # let KWin finish its own reshuffle
             restore(key)
+            if do_fit:
+                fit(verbose=False)          # clamp anything KWin left oversized/off-screen
             last = key
             last_snap = time.time()
         elif now - last_snap >= snap_every:
@@ -622,6 +717,9 @@ def main():
     apf = sub.add_parser("apply-preferred", help="tile everything into the preferred template (hotkey target)")
     apf.add_argument("--dry-run", action="store_true", help="show what would match/move, change nothing")
 
+    ft = sub.add_parser("fit", help="clamp off-screen / oversized windows back onto the screen")
+    ft.add_argument("--dry-run", action="store_true", help="show what would resize, change nothing")
+
     w = sub.add_parser("watch", help="auto snapshot/restore (or apply rules) on dock/undock")
     w.add_argument("--mode", choices=["snapshot", "rules"], default="snapshot",
                    help="snapshot: remember+restore layouts (default); rules: apply config.yaml")
@@ -643,6 +741,10 @@ def main():
 
     if args.cmd == "restore":
         restore()
+        return
+
+    if args.cmd == "fit":
+        fit(dry_run=args.dry_run)
         return
 
     if args.cmd == "save-preferred":
