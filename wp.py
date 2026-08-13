@@ -129,6 +129,17 @@ def raise_tab(tab_id, service):
 #     Unmaximizing first (the flag flips synchronously, even though the client
 #     resize is async) makes the write safe and the whole helper idempotent.
 _MAX_HELPER = """
+  // Intersect a rectangle with an output's MaximizeArea. Needed because a custom
+  // tile's absoluteGeometry spans the WHOLE output, panel included (on this setup
+  // DP-2's tiles are 1440 tall against a 1394 maximize area) — KWin trims that
+  // itself when it tiles a window, but we write frameGeometry explicitly (tile
+  // reassignment alone is unreliable for XWayland), so we must trim it too.
+  function clampToArea(g, a){
+    var x1=Math.max(g.x,a.x), y1=Math.max(g.y,a.y);
+    var x2=Math.min(g.x+g.width, a.x+a.width), y2=Math.min(g.y+g.height, a.y+a.height);
+    return { x:Math.round(x1), y:Math.round(y1),
+             width:Math.round(x2-x1), height:Math.round(y2-y1) };
+  }
   function maximizeOn(w, out, vd){
     if (w.setMaximize) w.setMaximize(false, false);
     var a = workspace.clientArea(2, out, vd);        // 2 = MaximizeArea (panel-aware)
@@ -457,8 +468,8 @@ _PLACE_FUNCS = _TILE_HELPERS + _MAX_HELPER + """
       var vd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
       var lv = leaves(out, vd);
       if (z.index < lv.length){
-        var tl = lv[z.index]; w.tile = tl; var g = tl.absoluteGeometry;
-        w.frameGeometry = { x:Math.round(g.x), y:Math.round(g.y), width:Math.round(g.width), height:Math.round(g.height) };
+        var tl = lv[z.index]; w.tile = tl;
+        w.frameGeometry = clampToArea(tl.absoluteGeometry, workspace.clientArea(2, out, vd));
       }
     } else if (z.type === "maximize" && out){
       w.tile = null;

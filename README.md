@@ -63,18 +63,31 @@ instead of becoming a plain window that merely looks like one. A maximized windo
 that **under**-fills the area is left alone — that's an app honouring size hints
 (KRDC, terminals with cell increments), and forcing it would never converge.
 
-## Maximizing the way the OS does
+## Placing windows the way the OS does
 
-Placing a window "maximized" — via a `maximize` zone, `restore`, or `fit` — goes
-through one helper that reproduces exactly what the titlebar button does. Two
-rules, both of which used to be broken and are the reason maximized windows came
-back oversized from a dock change:
+Both kinds of placement have to subtract the panel themselves, because the two
+rectangles KWin hands you — `output.geometry` and a tile's `absoluteGeometry` —
+are *raw* and span the full screen, panel included:
 
-1. **Maximize to the panel-aware area, not the output rect.** `output.geometry` is
-   the whole screen *including* the panel (1600×1000 on this laptop);
-   `workspace.clientArea(MaximizeArea, output, desktop)` excludes it (1600×954).
-   Using the former left every maximized window 46px too tall, with its bottom
-   edge hidden behind the taskbar.
+| Output | `output.geometry` | MaximizeArea | Tile rects |
+|--------|-------------------|--------------|------------|
+| eDP-1  | 1600×**1000**     | 1600×**954** | **1000** tall |
+| DP-2   | 3440×**1440**     | 3440×**1394**| **1440** tall |
+
+**Tiled** windows are clamped to the maximize area (`clampToArea`). KWin trims the
+tile itself when *it* tiles a window, but because tile reassignment alone is
+unreliable for XWayland windows we also write `frameGeometry` explicitly — and
+that write has to be trimmed the same way, or every tiled window on the external
+runs 46px under the panel.
+
+**Maximized** windows go through one helper that reproduces exactly what the
+titlebar button does. Two rules, both of which used to be broken and are the
+reason maximized windows came back oversized from a dock change:
+
+1. **Maximize to the panel-aware area, not the output rect** —
+   `workspace.clientArea(MaximizeArea, output, desktop)`, per the table above.
+   Using `output.geometry` left every maximized window 46px too tall, with its
+   bottom edge hidden behind the taskbar.
 2. **Never write `frameGeometry` while the window is still maximized.** KWin treats
    that write as the *new* maximized rectangle, so the window keeps the oversized
    geometry **and** stays flagged maximized — which in turn makes
