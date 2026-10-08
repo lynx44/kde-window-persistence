@@ -53,9 +53,12 @@ wp fit            # resize/move anything off-screen or oversized back into view
 wp fit --dry-run  # show what it would change, touch nothing
 ```
 
-It leaves tiled, fullscreen, and minimized windows alone. The `watch` daemon
-runs `fit` automatically right after each dock change, so this is mostly
-hands-off; the manual command is for when you open something new and it spills.
+It leaves fullscreen windows, and tiled windows that are on-screen, alone. A
+window still tiled to the monitor you just unplugged (KWin keeps the stale tile
+and its desktop coordinates) is untiled and clamped; minimized windows are fixed
+too, so they don't reappear off-screen when you click them in the taskbar. The
+`watch` daemon runs `fit` right after each dock change and once more a few
+seconds later, so this is mostly hands-off; the manual command is for when you open something new and it spills.
 
 Windows that are *flagged* maximized but still sized for the monitor you left are
 re-maximized (see below) rather than clamped, so they stay genuinely maximized
@@ -141,6 +144,10 @@ tab's title (`support@standardedge.com`, not `Inbox (3,658) - support@… - …`
 `save-preferred` defaults it to the full title, so trim volatile bits like unread
 counts. Use `wp apply-preferred --dry-run` to see exactly what matches, what's
 skipped, and why — without moving anything.
+
+After placing, `apply-preferred` re-checks every window a few times and re-places
+any that didn't stick — a window that was still maximized, or an app (IDEs,
+browsers right after login) that resized itself while starting up.
 
 The template is plain JSON — edit `desktops`/`screen`/`zone` or delete entries
 for windows you don't want the hotkey to touch. `zone` is one of

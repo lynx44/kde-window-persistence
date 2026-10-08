@@ -354,6 +354,12 @@ def snapshot(key=None, verbose=True):
         if verbose:
             print("snapshot: no response from KWin")
         return False
+    if state_key() != key:
+        # Monitor set changed mid-capture: this is KWin's post-unplug reshuffle, and
+        # saving it would clobber the good layout of the state we just left.
+        if verbose:
+            print("snapshot: monitors changed during capture, discarded")
+        return False
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(state_path(key), "w") as f:
         json.dump({"key": key, "windows": layout}, f)
@@ -383,7 +389,8 @@ def restore(key=None, verbose=True):
 # size, so windows sized for a big external can spill past the laptop screen.
 # New windows also open past the panel. `fit` clamps any floating window to its
 # screen's MAXIMIZE area (clientArea option 2 — panel-aware), so nothing hides
-# behind the panel or hangs off an edge. Tiled/fullscreen windows are left alone.
+# behind the panel or hangs off an edge. Fullscreen windows, and tiled windows that
+# are on-screen, are left alone; tiled ones stranded off-screen are untiled + clamped.
 
 FIT_JS = """
 (function(){
@@ -393,13 +400,22 @@ FIT_JS = """
   var wins = workspace.windowList();
   for (var i=0;i<wins.length;i++){
     var w = wins[i];
-    if (!w.normalWindow || w.skipTaskbar || w.tile || w.fullScreen || w.minimized) continue;
+    // Minimized windows are included: otherwise they come back off-screen the
+    // moment you click them in the taskbar.
+    if (!w.normalWindow || w.skipTaskbar || w.fullScreen) continue;
     var out = w.output || workspace.activeScreen;
     var vd = (w.desktops && w.desktops.length) ? w.desktops[0] : workspace.currentDesktop;
     var a = workspace.clientArea(2, out, vd);      // 2 = MaximizeArea (excludes panels)
     var ax=Math.round(a.x), ay=Math.round(a.y), aw=Math.round(a.width), ah=Math.round(a.height);
     var g = w.frameGeometry;
     var gx=Math.round(g.x), gy=Math.round(g.y), gw=Math.round(g.width), gh=Math.round(g.height);
+    if (w.tile){
+      // A healthy tiled window always sits inside its screen. One that doesn't is
+      // still tiled to the monitor we just unplugged — KWin keeps the stale tile
+      // and its desktop coordinates — so untile it and clamp it like any other.
+      if (gx >= ax-8 && gy >= ay-8 && gx+gw <= ax+aw+8 && gy+gh <= ay+ah+8) continue;
+      if (APPLY) w.tile = null;
+    }
     if (w.maximizeMode === 3){
       // Already flagged maximized but still sized for the output we left: re-maximize
       // here so KWin recomputes the rect, rather than clamping it into a plain window
@@ -468,6 +484,11 @@ _PLACE_FUNCS = _TILE_HELPERS + _MAX_HELPER + """
       var vd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
       var lv = leaves(out, vd);
       if (z.index < lv.length){
+        // Apps often relaunch maximized (browsers, IDEs). A maximized window takes the
+        // frameGeometry write as its new maximized rect (see _MAX_HELPER), so drop
+        // maximize/fullscreen first or the window never actually fills the tile.
+        if (w.fullScreen) w.fullScreen = false;
+        if (w.setMaximize) w.setMaximize(false, false);
         var tl = lv[z.index]; w.tile = tl;
         w.frameGeometry = clampToArea(tl.absoluteGeometry, workspace.clientArea(2, out, vd));
       }
@@ -480,30 +501,64 @@ _PLACE_FUNCS = _TILE_HELPERS + _MAX_HELPER + """
       w.frameGeometry = { x:z.geom[0], y:z.geom[1], width:z.geom[2], height:z.geom[3] };
     }
   }
+  // Did placeWin stick? Clients resize asynchronously, and apps still starting up
+  // (IDEs restoring their own bounds, browsers restoring maximize) can override a
+  // placement after the fact. TOL absorbs KWin's tile padding and size increments.
+  function placedOk(w, e){
+    var TOL = 16;
+    var vds = workspace.desktops;
+    var out = e.screen ? findOut(e.screen) : null;
+    var z = e.zone || {};
+    if (!out) return true;                       // nothing we could do anyway
+    var vd = (e.desktops && e.desktops.length && e.desktops[0] < vds.length) ? vds[e.desktops[0]] : workspace.currentDesktop;
+    var a = workspace.clientArea(2, out, vd);
+    var g = w.frameGeometry;
+    function near(t){
+      return Math.abs(g.x-t.x) <= TOL && Math.abs(g.y-t.y) <= TOL &&
+             Math.abs(g.x+g.width-t.x-t.width) <= TOL && Math.abs(g.y+g.height-t.y-t.height) <= TOL;
+    }
+    if (z.type === "tile"){
+      var lv = leaves(out, vd);
+      if (z.index >= lv.length) return true;
+      return w.tile === lv[z.index] && w.maximizeMode === 0 &&
+             near(clampToArea(lv[z.index].absoluteGeometry, a));
+    }
+    if (z.type === "maximize"){
+      // under-filling is allowed: that's an app honouring size hints (see FIT_JS)
+      return w.maximizeMode === 3 && g.x >= a.x-2 && g.y >= a.y-2 &&
+             g.x+g.width <= a.x+a.width+2 && g.y+g.height <= a.y+a.height+2;
+    }
+    return true;
+  }
 """
 
-# Place specific windows (matched in Python) by their internalId.
+# Place specific windows by their internalId, reporting {placed, miss}. With
+# ONLY_OFF, only windows whose placement didn't stick are re-placed — that's the
+# verify pass apply_preferred repeats until everything has settled.
 # DATA = [{ id, desktops, screen, zone }]
 PREF_PLACE_BY_ID_JS = ("(function(){" + _PLACE_FUNCS + """
   var byId = {}; var wins = workspace.windowList();
   for (var i=0;i<wins.length;i++) byId[String(wins[i].internalId)] = wins[i];
-  var DATA = %DATA%;
+  var DATA = %DATA%, ONLY_OFF = %ONLY_OFF%;
   var placed = 0, miss = 0;
   for (var j=0;j<DATA.length;j++){
     var e = DATA[j], w = byId[e.id];
     if (!w){ miss++; continue; }
+    if (ONLY_OFF && placedOk(w, e)) continue;
     placeWin(w, e); placed++;
   }
-  throw new Error("WPPREF placed=" + placed + " miss=" + miss);
-})();""")
+  callDBus("%SINK%", "/", "%SINK%", "Report", JSON.stringify({placed:placed, miss:miss}));
+})();""").replace("%SINK%", SINK_BUS)
 
-# Place the currently-active window (used right after a browser tab is focused/raised).
+# Place the currently-active window (used right after a browser tab is focused/raised)
+# and report its id so the verify pass can revisit it. Refuses a window of the wrong
+# app — i.e. the raise hadn't landed yet — rather than tiling some other window.
 PREF_ACTIVE_JS = ("(function(){" + _PLACE_FUNCS + """
-  var w = workspace.activeWindow;
-  if (!w) throw new Error("WPPREF1: no active window");
-  placeWin(w, %ENTRY%);
-  throw new Error("WPPREF1 placed " + w.resourceClass);
-})();""")
+  var w = workspace.activeWindow, e = %ENTRY%;
+  var r = { id:null, cls: w ? w.resourceClass : null };
+  if (w && w.resourceClass === e.app){ placeWin(w, e); r.id = String(w.internalId); }
+  callDBus("%SINK%", "/", "%SINK%", "Report", JSON.stringify(r));
+})();""").replace("%SINK%", SINK_BUS)
 
 
 def pref_path(key):
@@ -634,20 +689,46 @@ def apply_preferred(key=None, dry_run=False, settle_ms=350):
         print(f"[dry-run] would place {total} / {len(entries)} entries for {key!r}")
         return True
 
+    def place_by_id(payload, only_off):
+        js = (PREF_PLACE_BY_ID_JS.replace("%DATA%", json.dumps(payload))
+              .replace("%ONLY_OFF%", "true" if only_off else "false"))
+        return run_collecting_script(js) or {"placed": 0, "miss": 0}
+
+    def target(e, win_id):
+        return {"id": win_id, "desktops": e["desktops"], "screen": e["screen"], "zone": e["zone"]}
+
     # Execute: focus each browser tab (raises its window) then place the active window.
+    # A slow raise (e.g. just after login) gets one longer retry before we give up.
     settle = settle_ms / 1000.0
+    placed = []
     for e, hit in browser_plan:
-        raise_tab(hit[0], hit[3])
-        time.sleep(settle)
-        run_kwin_script(PREF_ACTIVE_JS.replace("%ENTRY%", json.dumps(e)))
+        r = None
+        for wait in (settle, settle * 3):
+            raise_tab(hit[0], hit[3])
+            time.sleep(wait)
+            r = run_collecting_script(PREF_ACTIVE_JS.replace("%ENTRY%", json.dumps(e)))
+            if r and r.get("id"):
+                placed.append(target(e, r["id"]))
+                break
+        else:
+            print(f"  ! {e['app']}: tab raised but active window was {(r or {}).get('cls')!r}; not placed")
 
     # Place app windows by internalId in one pass.
-    payload = [{"id": w["id"], "desktops": e["desktops"], "screen": e["screen"], "zone": e["zone"]}
-               for e, w in app_placements]
+    payload = [target(e, w["id"]) for e, w in app_placements]
     if payload:
-        run_kwin_script(PREF_PLACE_BY_ID_JS.replace("%DATA%", json.dumps(payload)))
+        place_by_id(payload, only_off=False)
+    placed += payload
 
-    print(f"apply-preferred: placed {total} / {len(entries)} entries for {key!r}")
+    # Verify: re-place anything that didn't stick (still maximized, resized itself
+    # while starting up, client ignored the first configure, …).
+    for _ in range(3):
+        time.sleep(0.8)
+        if not place_by_id(placed, only_off=True)["placed"]:
+            break
+    else:
+        print("  ! some windows still don't match their zone (app may be enforcing its own size)")
+
+    print(f"apply-preferred: placed {len(placed)} / {len(entries)} entries for {key!r}")
     return True
 
 
@@ -670,6 +751,8 @@ def watch_snapshot(interval=2.0, settle=1.5, snap_every=4.0, do_fit=True):
             restore(key)
             if do_fit:
                 fit(verbose=False)          # clamp anything KWin left oversized/off-screen
+                time.sleep(settle * 2)      # windows still settling (e.g. resume from suspend)
+                fit(verbose=False)          #   can drift back off-screen; catch them too
             last = key
             last_snap = time.time()
         elif now - last_snap >= snap_every:
